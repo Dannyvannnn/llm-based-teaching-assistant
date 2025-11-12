@@ -10,7 +10,7 @@ def main():
     print(f"Extracted Question-Answer Pairs: {ef}")
     sf = studentsolutionformatter.scan_for_student_submissions(student_submission_directory)
     print(f"Student Submissions: {sf}\n")
-    solutionevaluator.batch_process_student_submissions(sf, ef)
+    solutionevaluator.llm_eval_student_batch_process(sf, ef)
 
 
 if __name__ == "__main__":
