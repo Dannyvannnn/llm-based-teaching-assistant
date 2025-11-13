@@ -1,11 +1,7 @@
 PyPDF2
 python-docx
-os
-io
-re
 pdfplumber
 markdown
-json
 openai
 accelerate
 pandas
