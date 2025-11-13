@@ -10,7 +10,7 @@ import pandas as pd
 import studentsolutionformatter
 from openai_client import client
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 # is_scoring = True
 
@@ -98,7 +98,7 @@ def get_response_with_model(
             params["max_tokens"] = max_tokens
         
         response = client.chat.completions.create(**params)
-        return response
+        return response.to_dict()
     
     # ----------------- Hugging Face / Local -----------------
     elif backend == "huggingface":
@@ -106,17 +106,18 @@ def get_response_with_model(
         tokenizer = AutoTokenizer.from_pretrained(model)
 
         if load_in_4bit:
+            bnb_config = BitsAndBytesConfig(load_in_4bit=True)
             generator = AutoModelForCausalLM.from_pretrained(
-            model,
-            device_map="auto",
-            dtype=torch.float16,
-            load_in_4bit=load_in_4bit
-        )
+                model,
+                device_map="auto",
+                dtype=torch.float16,
+                quantization_config=bnb_config
+            )
         else:
             generator = AutoModelForCausalLM.from_pretrained(
                 model,
                 device_map="auto",
-                torch_dtype=torch.float16
+                dtype=torch.float16
             )
 
         inputs = tokenizer(prompt, return_tensors="pt").to(generator.device)
@@ -126,17 +127,35 @@ def get_response_with_model(
         # Only include parameters if they are not None
         if temperature is not None:
             params["temperature"] = temperature
+            params["do_sample"] = True
         if top_p is not None:
             params["top_p"] = top_p
+            params["do_sample"] = True
         if max_tokens is not None:
             params["max_new_tokens"] = max_tokens
+            params["do_sample"] = True
 
         # response = generator(prompt, **params)
-        response = generator.generate(
+        output_ids = generator.generate(
             **inputs,
             **params
         )
-        return response[0]["generated_text"]
+
+        # Decode into text
+        output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+        # Wrap in OpenAI-like response format
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": output_text
+                    }
+                }
+            ]
+        }
+        return response
 
 
 # --- LLM evaluator ---
@@ -159,16 +178,22 @@ Evaluate the user's answer in JSON with:
     end_time = time.time()
     
     # quantity scoring
-    output = response.choices[0].message.content.strip()
-    token_count = response.usage.total_tokens if hasattr(response, "usage") else len(output.split())
+    output = response["choices"][0]["message"]["content"].strip()
     duration = end_time - start_time
+
+    # Count tokens in output for both backends
+    if "usage" in response and "total_tokens" in response["usage"]:
+        token_count = response["usage"]["total_tokens"]
+    else:
+        # Fallback for local / HF models
+        token_count = len(output.split())
 
     # Accuracy Scoring
     # accuracy = int(reference_answer.lower() in output.lower())
     accuracy = hybrid_accuracy(reference_answer, output)
 
     # Add checks for empty response or choices
-    if not response or not response.choices:
+    if not response or "choices" not in response or not response["choices"]:
         print("Warning: LLM response or choices list is empty.")
         return {
             "correctness": "incorrect",
@@ -176,7 +201,8 @@ Evaluate the user's answer in JSON with:
             "explanation": "LLM returned an empty response or no choices."
         }
 
-    llm_content = response.choices[0].message.content
+    # Access the assistant message content
+    llm_content = response["choices"][0].get("message", {}).get("content", "")
     if not llm_content:
         print("Warning: LLM message content is empty.")
         return {
@@ -185,26 +211,31 @@ Evaluate the user's answer in JSON with:
             "explanation": "LLM returned empty message content."
         }
 
+    # Ensure llm_content is a string
+    llm_content = str(llm_content)
+
     # Extract JSON from markdown code block if present
     json_match = re.search(r'```json\s*(.*?)\s*```', llm_content, re.DOTALL)
     if json_match:
         json_string = json_match.group(1)
     else:
-        json_string = llm_content # Assume it's pure JSON if no markdown block
+        json_string = llm_content.strip()  # fallback, assume pure JSON
 
     try:
         json_data = json.loads(json_string)
 
+        # Append extra evaluation info
         json_data["accuracy"] = accuracy
         json_data["token_count"] = token_count
         json_data["duration"] = duration
 
         return json_data
+
     except json.JSONDecodeError as e:
         print(f"JSONDecodeError: {e}")
         print(f"Raw LLM response (attempted parse): {json_string}")
         print(f"Original LLM content: {llm_content}")
-        # Return a default 'incorrect' evaluation to allow processing to continue
+        # Return default 'incorrect' evaluation to continue processing
         return {
             "correctness": "incorrect",
             "score": 0.0,
@@ -260,8 +291,10 @@ def Write_Student_Evaluation(student_evaluation_list: list, student_name: str, *
         writer.writerows(student_evaluation_list)
 
 
-def batch_process_student_submissions(student_submissions_data : list[str], questions_answers : list[dict], model_settings):
+def batch_process_student_submissions(student_submissions_data : list[str], questions_answers : list[dict], llm_choice = "gpt-4o"):
+    model_settings = get_llm_setting(llm_choice)
     metadata_eval_overall = []
+    
     for student in student_submissions_data:
         merged = []
         student_answer_eval = []
@@ -296,31 +329,26 @@ def batch_process_student_submissions(student_submissions_data : list[str], ques
                 'duration': r['duration']
             }
 
-            # if is_scoring:
-                # student_answer_results["model"] = r['model']
-                # student_answer_results["accuracy"] = r['accuracy']
-                # student_answer_results["token_count"] = r['token_count']
-                # student_answer_results["duration"] = r['duration']
-
             student_answer_eval.append(student_answer_results)
             metadata_eval_overall.append(llm_metadata)
 
         Write_Student_Evaluation(student_answer_eval, student['student_name'], model = model_settings['model'])
     return model_settings['model'], metadata_eval_overall
 
-def llm_eval_student_batch_process (student_submissions_data : list[str], questions_answers : list[dict]):
+def get_llm_setting (llm_choice: str):
     # --- LLM Settings to be tested --- 
     LLM_SETTINGS = {
         # -------------------- OpenAI models --------------------
-        "gpt-4o-mini": {
-            "backend": "openai",
-            "model": "gpt-4o-mini",
-            "temperature": 0,
-            "top_p": 1,
-        },
+        
         "gpt-4o": {
             "backend": "openai",
             "model": "gpt-4o",
+            "temperature": 0,
+            "top_p": 1,
+        },
+        "gpt-4o-mini": {
+            "backend": "openai",
+            "model": "gpt-4o-mini",
             "temperature": 0,
             "top_p": 1,
         },
@@ -355,17 +383,19 @@ def llm_eval_student_batch_process (student_submissions_data : list[str], questi
         #     "load_in_4bit":True
         # }
     }
+    if llm_choice == "All":
+        return LLM_SETTINGS.keys()
+    return LLM_SETTINGS[llm_choice]
+
+def llm_eval_student_batch_process (student_submissions_data : list[str], questions_answers : list[dict]):
+    llm = get_llm_setting("All")
+    print(f"LLM list: {llm}")
 
     llm_results = []
     # processing LLM evaluation csv
-    for settings in LLM_SETTINGS:
+    for settings in llm:
         # print (LLM_SETTINGS[settings])
-        llm_results.append(batch_process_student_submissions(student_submissions_data, questions_answers, LLM_SETTINGS[settings]))
-
-    # Go through each csv to sum up time taken, accuracy and token count
-    # print()
-    # print(llm_results)
-    # print()
+        llm_results.append(batch_process_student_submissions(student_submissions_data, questions_answers, settings))
 
     # Store results
     summary = {}
