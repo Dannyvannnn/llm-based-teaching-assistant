@@ -442,7 +442,7 @@ def get_llm_setting (llm_choice: str):
         return LLM_SETTINGS.keys()
     
     # Otherwise return 
-    return LLM_SETTINGS[llm_choice.lower]
+    return LLM_SETTINGS[llm_choice.lower()]
 
 def llm_eval_student_batch_process (student_submissions_data : list[str], questions_answers : list[dict]):
     """
@@ -486,4 +486,5 @@ def llm_eval_student_batch_process (student_submissions_data : list[str], questi
     # Optional: Save to CSV
     df.to_csv("llm_evaluation_summary.csv", index=True)
     print(" Saved CSV: llm_evaluation_summary.csv")
+
 
