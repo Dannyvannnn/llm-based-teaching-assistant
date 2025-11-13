@@ -7,3 +7,6 @@ pdfplumber
 markdown
 json
 openai
+accelerate
+pandas
+bitsandbytes

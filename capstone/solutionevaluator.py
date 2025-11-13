@@ -4,10 +4,52 @@ import re
 import csv
 import time
 
+import numpy as np
+import pandas as pd
+
 import studentsolutionformatter
 from openai_client import client
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-is_scoring = True
+# is_scoring = True
+
+
+def semantic_similarity(a, b):
+    emb = client.embeddings.create(input=[a, b], model="text-embedding-3-small")
+    v1, v2 = emb.data[0].embedding, emb.data[1].embedding
+    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+
+def hybrid_accuracy(output: str, reference_answer: str):
+    """
+    Compute a hybrid accuracy score between model output and reference answer
+    using:
+      - semantic similarity (OpenAI embeddings)
+      - token overlap (bag-of-words)
+    Returns a float between 0 and 1.
+    """
+
+    # 🧼 Clean inputs
+    if not output or not reference_answer:
+        return 0.0
+    out = output.strip().lower()
+    ref = reference_answer.strip().lower()
+
+    # Token overlap
+    out_tokens = set(out.split())
+    ref_tokens = set(ref.split())
+    overlap = len(out_tokens & ref_tokens) / max(1, len(ref_tokens))
+
+    # Semantic similarity via embeddings
+    cosine_sim = semantic_similarity (out, ref)
+
+    if overlap > 0.9 or cosine_sim > 0.9:
+        return 1
+
+    # Weighted combination
+    hybrid_score = cosine_sim + overlap
+    return min(1, hybrid_score)
 
 
 def extract_user_answer(user_input, question_text_to_remove=None) -> str:
@@ -30,28 +72,71 @@ def extract_user_answer(user_input, question_text_to_remove=None) -> str:
 def get_response_with_model(
         prompt, 
         *, 
+        backend = "openai",
         model="gpt-4o", 
         temperature=None,
         top_p=None,
         max_tokens=None,
+        load_in_4bit=False
         ):
     
-    # Build the parameters dictionary
-    params = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}]
-    }
+    # Set up LLM using correct format
+    # ----------------- OpenAI -----------------
+    if backend == 'openai':
+        # Build the parameters dictionary
+        params = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}]
+        }
 
-    # Only include parameters if they are not None
-    if temperature is not None:
-        params["temperature"] = temperature
-    if top_p is not None:
-        params["top_p"] = top_p
-    if max_tokens is not None:
-        params["max_tokens"] = max_tokens
+        # Only include parameters if they are not None
+        if temperature is not None:
+            params["temperature"] = temperature
+        if top_p is not None:
+            params["top_p"] = top_p
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
+        
+        response = client.chat.completions.create(**params)
+        return response
     
-    response = client.chat.completions.create(**params)
-    return response
+    # ----------------- Hugging Face / Local -----------------
+    elif backend == "huggingface":
+        # generator = pipeline("text-generation", model=model)
+        tokenizer = AutoTokenizer.from_pretrained(model)
+
+        if load_in_4bit:
+            generator = AutoModelForCausalLM.from_pretrained(
+            model,
+            device_map="auto",
+            dtype=torch.float16,
+            load_in_4bit=load_in_4bit
+        )
+        else:
+            generator = AutoModelForCausalLM.from_pretrained(
+                model,
+                device_map="auto",
+                torch_dtype=torch.float16
+            )
+
+        inputs = tokenizer(prompt, return_tensors="pt").to(generator.device)
+
+        params = {}
+
+        # Only include parameters if they are not None
+        if temperature is not None:
+            params["temperature"] = temperature
+        if top_p is not None:
+            params["top_p"] = top_p
+        if max_tokens is not None:
+            params["max_new_tokens"] = max_tokens
+
+        # response = generator(prompt, **params)
+        response = generator.generate(
+            **inputs,
+            **params
+        )
+        return response[0]["generated_text"]
 
 
 # --- LLM evaluator ---
@@ -68,21 +153,19 @@ Evaluate the user's answer in JSON with:
 - score: 0 to 1
 - explanation: short reason
 """
-    if is_scoring:
-        start_time = time.time()
     
+    start_time = time.time() 
     response = get_response_with_model(prompt, **model_settings)
+    end_time = time.time()
+    
+    # quantity scoring
+    output = response.choices[0].message.content.strip()
+    token_count = response.usage.total_tokens if hasattr(response, "usage") else len(output.split())
+    duration = end_time - start_time
 
-    if is_scoring:
-        end_time = time.time()
-        
-        # quantity scoring
-        output = response.choices[0].message.content.strip()
-        token_count = response.usage.total_tokens if hasattr(response, "usage") else len(output.split())
-        duration = end_time - start_time
-
-        # Accuracy
-        accuracy = int(reference_answer.lower() in output.lower())
+    # Accuracy Scoring
+    # accuracy = int(reference_answer.lower() in output.lower())
+    accuracy = hybrid_accuracy(reference_answer, output)
 
     # Add checks for empty response or choices
     if not response or not response.choices:
@@ -112,11 +195,9 @@ Evaluate the user's answer in JSON with:
     try:
         json_data = json.loads(json_string)
 
-        if is_scoring:
-            # json_data["model"] = model_settings['model']
-            json_data["accuracy"] = accuracy
-            json_data["token_count"] = token_count
-            json_data["duration"] = duration
+        json_data["accuracy"] = accuracy
+        json_data["token_count"] = token_count
+        json_data["duration"] = duration
 
         return json_data
     except json.JSONDecodeError as e:
@@ -180,6 +261,7 @@ def Write_Student_Evaluation(student_evaluation_list: list, student_name: str, *
 
 
 def batch_process_student_submissions(student_submissions_data : list[str], questions_answers : list[dict], model_settings):
+    metadata_eval_overall = []
     for student in student_submissions_data:
         merged = []
         student_answer_eval = []
@@ -196,13 +278,11 @@ def batch_process_student_submissions(student_submissions_data : list[str], ques
         # Now passing only merged directly to the evaluation function
         results = evaluate_student_submission(merged, model_settings)
 
-        # print("-----", student['student_name'], "-----")
         for r in results:
             if (r['question_id'] == "None."):
                 continue
 
             student_answer_results = {
-                # "student_name": student['student_name'],
                 "question_id": r['question_id'],
                 "answer": r['raw_user_answer'],
                 "correctness": r['correctness'],
@@ -210,40 +290,106 @@ def batch_process_student_submissions(student_submissions_data : list[str], ques
                 "explanation": r['explanation']
             }
 
-            if is_scoring:
+            llm_metadata = {
+                'accuracy': r['accuracy'],
+                'token_count': r['token_count'],
+                'duration': r['duration']
+            }
+
+            # if is_scoring:
                 # student_answer_results["model"] = r['model']
-                student_answer_results["accuracy"] = r['accuracy']
-                student_answer_results["token_count"] = r['token_count']
-                student_answer_results["duration"] = r['duration']
+                # student_answer_results["accuracy"] = r['accuracy']
+                # student_answer_results["token_count"] = r['token_count']
+                # student_answer_results["duration"] = r['duration']
 
             student_answer_eval.append(student_answer_results)
+            metadata_eval_overall.append(llm_metadata)
 
         Write_Student_Evaluation(student_answer_eval, student['student_name'], model = model_settings['model'])
+    return model_settings['model'], metadata_eval_overall
 
 def llm_eval_student_batch_process (student_submissions_data : list[str], questions_answers : list[dict]):
     # --- LLM Settings to be tested --- 
     LLM_SETTINGS = {
-        "gpt-4o": {
-            "model": "gpt-4o",
-            "temperature": 0,
-            "top_p": 1,
-        },
+        # -------------------- OpenAI models --------------------
         "gpt-4o-mini": {
+            "backend": "openai",
             "model": "gpt-4o-mini",
             "temperature": 0,
             "top_p": 1,
         },
+        "gpt-4o": {
+            "backend": "openai",
+            "model": "gpt-4o",
+            "temperature": 0,
+            "top_p": 1,
+        },
         "gpt-3.5-turbo": {
+            "backend": "openai",
             "model": "gpt-3.5-turbo",
             "temperature": 0,
             "top_p": 1,
         },
+        
+        # -------------------- Hugging Face / Local models --------------------
+        # "llama-2-7b": {
+        #     "backend": "huggingface",
+        #     "model": "meta-llama/Llama-2-7b-chat-hf",
+        #     "temperature": 0.1,
+        #     "top_p": 1,
+        # },
+        # "mpt-7b-instruct": {
+        #     "backend": "huggingface",
+        #     "model": "mosaicml/mpt-7b",
+        #     "temperature": 0.1,
+        #     "top_p": 0.9,
+        #     "max_tokens": 500,
+        #     "load_in_4bit":True
+        # },
+        # "gpt4all-mini": {
+        #     "backend": "huggingface",
+        #     "model": "nomic-ai/gpt4all-mini",
+        #     "temperature": 0.1,
+        #     "top_p": 0.9,
+        #     "max_tokens": 500,
+        #     "load_in_4bit":True
+        # }
     }
 
+    llm_results = []
     # processing LLM evaluation csv
     for settings in LLM_SETTINGS:
         # print (LLM_SETTINGS[settings])
-        batch_process_student_submissions(student_submissions_data, questions_answers, LLM_SETTINGS[settings])
+        llm_results.append(batch_process_student_submissions(student_submissions_data, questions_answers, LLM_SETTINGS[settings]))
 
     # Go through each csv to sum up time taken, accuracy and token count
+    # print()
+    # print(llm_results)
+    # print()
+
+    # Store results
+    summary = {}
+
+    for model, results in llm_results:
+        total_accuracy = sum(item['accuracy'] for item in results)
+        total_tokens = sum(item['token_count'] for item in results)
+        total_duration = sum(item['duration'] for item in results)
+        count = len(results)
+        
+        summary[model] = {
+            'total_accuracy': total_accuracy,
+            'avg_accuracy': total_accuracy / count,
+            'total_tokens': total_tokens,
+            'total_duration': total_duration,
+            'avg_duration': total_duration / count,
+            'num_entries': count
+        }
+
+    # Convert to DataFrame for nice display
+    df = pd.DataFrame(summary).T
+    print(df)
+
+    # Optional: Save to CSV
+    df.to_csv("llm_evaluation_summary.csv", index=True)
+    print(" Saved CSV: llm_evaluation_summary.csv")
 
